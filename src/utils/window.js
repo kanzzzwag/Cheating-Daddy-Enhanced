@@ -36,7 +36,8 @@ function createWindow(sendToRenderer, geminiSessionRef) {
     session.defaultSession.setDisplayMediaRequestHandler(
         (request, callback) => {
             desktopCapturer.getSources({ types: ['screen'] }).then(sources => {
-                callback({ video: sources[0], audio: 'loopback' });
+                // Only grant loopback audio when the renderer asked for it (audio mode "off" requests video only)
+                callback(request.audioRequested ? { video: sources[0], audio: 'loopback' } : { video: sources[0] });
             });
         },
         { useSystemPicker: true }

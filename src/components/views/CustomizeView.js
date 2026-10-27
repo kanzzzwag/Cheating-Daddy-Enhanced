@@ -182,6 +182,7 @@ export class CustomizeView extends LitElement {
         layoutMode: { type: String },
         keybinds: { type: Object },
         googleSearchEnabled: { type: Boolean },
+        fastAnswers: { type: Boolean },
         backgroundTransparency: { type: Number },
         fontSize: { type: Number },
         theme: { type: String },
@@ -214,6 +215,7 @@ export class CustomizeView extends LitElement {
         this.backgroundTransparency = 0.8;
         this.fontSize = 20;
         this.audioMode = 'speaker_only';
+        this.fastAnswers = false;
         this.customPrompt = '';
         this.theme = 'dark';
         this._loadFromStorage();
@@ -230,6 +232,7 @@ export class CustomizeView extends LitElement {
             this.backgroundTransparency = prefs.backgroundTransparency ?? 0.8;
             this.fontSize = prefs.fontSize ?? 20;
             this.audioMode = prefs.audioMode ?? 'speaker_only';
+            this.fastAnswers = prefs.fastAnswers ?? false;
             this.customPrompt = prefs.customPrompt ?? '';
             this.theme = prefs.theme ?? 'dark';
             if (keybinds) {
@@ -368,6 +371,11 @@ export class CustomizeView extends LitElement {
         this.requestUpdate();
     }
 
+    async handleFastAnswersChange(e) {
+        this.fastAnswers = e.target.checked;
+        await cheatingDaddy.storage.updatePreference('fastAnswers', this.fastAnswers);
+    }
+
     async handleGoogleSearchChange(e) {
         this.googleSearchEnabled = e.target.checked;
         await cheatingDaddy.storage.updatePreference('googleSearchEnabled', this.googleSearchEnabled);
@@ -486,6 +494,7 @@ export class CustomizeView extends LitElement {
                 selectedScreenshotInterval: '5',
                 selectedImageQuality: 'medium',
                 audioMode: 'speaker_only',
+                fastAnswers: false,
                 fontSize: 20,
                 backgroundTransparency: 0.8,
                 googleSearchEnabled: false,
@@ -508,6 +517,7 @@ export class CustomizeView extends LitElement {
             this.selectedLanguage = defaults.selectedLanguage;
             this.selectedImageQuality = defaults.selectedImageQuality;
             this.audioMode = defaults.audioMode;
+            this.fastAnswers = defaults.fastAnswers;
             this.fontSize = defaults.fontSize;
             this.backgroundTransparency = defaults.backgroundTransparency;
             this.googleSearchEnabled = defaults.googleSearchEnabled;
@@ -575,12 +585,13 @@ export class CustomizeView extends LitElement {
                     <div class="form-group">
                         <label class="form-label">Audio Mode</label>
                         <select class="control" .value=${this.audioMode} @change=${this.handleAudioModeSelect}>
+                            <option value="off">Off (Screenshots and Text Only)</option>
                             <option value="speaker_only">Speaker Only (Interviewer)</option>
                             <option value="mic_only">Microphone Only (Me)</option>
                             <option value="both">Both Speaker and Microphone</option>
                         </select>
                     </div>
-                    ${this.audioMode !== 'speaker_only' ? html`
+                    ${this.audioMode === 'mic_only' || this.audioMode === 'both' ? html`
                         <div class="warning-callout">May cause unexpected behavior. Only change this if you know what you're doing.</div>
                     ` : ''}
                     <div class="form-group">
@@ -591,6 +602,10 @@ export class CustomizeView extends LitElement {
                             <option value="low">Low Quality</option>
                         </select>
                     </div>
+                    <label class="toggle-row">
+                        <input class="toggle-input" type="checkbox" .checked=${this.fastAnswers} @change=${this.handleFastAnswersChange} />
+                        <span class="toggle-label">Fast answers (lite models, ~3s instead of ~13s, less accurate on hard tasks)</span>
+                    </label>
                 </div>
             </section>
         `;

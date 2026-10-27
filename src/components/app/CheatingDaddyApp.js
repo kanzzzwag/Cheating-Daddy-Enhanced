@@ -388,6 +388,7 @@ export class CheatingDaddyApp extends LitElement {
         _updateAvailable: { state: true },
         _whisperDownloading: { state: true },
         _localAiDownloadProgress: { state: true },
+        _geminiQuota: { state: true },
     };
 
     constructor() {
@@ -481,6 +482,9 @@ export class CheatingDaddyApp extends LitElement {
             ipcRenderer.on('local-ai-download-progress', (_, progress) => {
                 this._localAiDownloadProgress = progress;
             });
+            ipcRenderer.on('gemini-quota', (_, quota) => {
+                this._geminiQuota = quota;
+            });
         }
     }
 
@@ -496,6 +500,7 @@ export class CheatingDaddyApp extends LitElement {
             ipcRenderer.removeAllListeners('reconnect-failed');
             ipcRenderer.removeAllListeners('whisper-downloading');
             ipcRenderer.removeAllListeners('local-ai-download-progress');
+            ipcRenderer.removeAllListeners('gemini-quota');
         }
     }
 
@@ -958,6 +963,11 @@ export class CheatingDaddyApp extends LitElement {
                 <div class="live-bar-center">${profileLabels[this.selectedProfile] || 'Session'}</div>
                 <div class="live-bar-right">
                     ${this.statusText ? html`<span class="live-bar-text">${this.statusText}</span>` : ''}
+                    ${this._geminiQuota
+                        ? html`<span class="live-bar-text" title="Model that answered last · estimated free requests left today (resets at midnight Pacific time)"
+                              >${this._geminiQuota.model} · ${this._geminiQuota.remaining}/${this._geminiQuota.total} left</span
+                          >`
+                        : ''}
                     <span class="live-bar-text">${this.getElapsedTime()}</span>
                     ${this._isClickThrough ? html`<span class="live-bar-text">[click through]</span>` : ''}
                     <span class="live-bar-text clickable" @click=${() => this.handleHideToggle()}>[hide]</span>

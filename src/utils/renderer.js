@@ -144,9 +144,11 @@ async function initializeGemini(profile = 'interview', language = 'en-US') {
     const apiKey = await storage.getApiKey();
     if (apiKey) {
         const prefs = await storage.getPreferences();
-        const success = await ipcRenderer.invoke('initialize-gemini', apiKey, prefs.customPrompt || '', profile, language);
+        // Without audio there is nothing to stream, so skip the token-hungry Live session
+        const liveAudio = prefs.audioMode !== 'off';
+        const success = await ipcRenderer.invoke('initialize-gemini', apiKey, prefs.customPrompt || '', profile, language, liveAudio);
         if (success) {
-            cheatingDaddy.setStatus('Live');
+            cheatingDaddy.setStatus(liveAudio ? 'Live' : 'Ready');
         } else {
             cheatingDaddy.setStatus('error');
         }
@@ -207,7 +209,19 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
     const audioMode = preferencesCache.audioMode || 'speaker_only';
 
     try {
-        if (isMacOS) {
+        if (audioMode === 'off') {
+            // Audio disabled - capture the screen only, no audio is streamed to the AI
+            mediaStream = await navigator.mediaDevices.getDisplayMedia({
+                video: {
+                    frameRate: 1,
+                    width: { ideal: 1920 },
+                    height: { ideal: 1080 },
+                },
+                audio: false,
+            });
+
+            console.log('Screen-only capture started - audio disabled');
+        } else if (isMacOS) {
             // On macOS, use SystemAudioDump for audio and getDisplayMedia for screen
             console.log('Starting macOS capture with SystemAudioDump...');
 

@@ -32,6 +32,7 @@ const DEFAULT_PREFERENCES = {
     fontSize: 'medium',
     backgroundTransparency: 0.8,
     googleSearchEnabled: false,
+    fastAnswers: false,
     localLlmModel: 'unsloth/Qwen3.5-4B-GGUF:Q4_K_M',
     whisperModel: 'tiny.en',
 };
@@ -331,10 +332,10 @@ function incrementLimitCount(model) {
     }
 
     // Increment the appropriate model count
-    if (model === 'gemini-2.5-flash') {
-        todayEntry.flash.count++;
-    } else if (model === 'gemini-2.5-flash-lite') {
+    if (model.includes('flash-lite')) {
         todayEntry.flashLite.count++;
+    } else if (model.includes('flash')) {
+        todayEntry.flash.count++;
     }
 
     setLimits(limits);
@@ -356,18 +357,86 @@ function incrementCharUsage(provider, model, charCount) {
     return todayEntry;
 }
 
-function getAvailableModel() {
-    const todayLimits = getTodayLimits();
+// Free tier gives 20 requests/day per model, so each model in this list adds its own quota.
+// gemini-2.5-* is gone for new users (404) and gemini-3.8-flash is often overloaded (503).
+const GEMINI_FALLBACK_MODELS = [
+    'gemini-3.7-flash',
+    'gemini-3.5-flash',
+    'gemini-3.6-flash',
+    'gemini-3-flash-preview',
+    'gemini-3.8-flash',
+    'gemini-3.5-flash-lite',
+    'gemini-3.1-flash-lite',
+];
+const GEMINI_FREE_DAILY_REQUESTS = 20;
 
-    // RPD limits: flash = 20, flash-lite = 20
-    // After both exhausted, fall back to flash (for paid API users)
-    if (todayLimits.flash.count < 20) {
-        return 'gemini-2.5-flash';
-    } else if (todayLimits.flashLite.count < 20) {
-        return 'gemini-2.5-flash-lite';
+function getGeminiQuotaPath() {
+    return path.join(getConfigDir(), 'gemini-quota.json');
+}
+
+// Google resets free tier quotas at midnight Pacific time
+function getPacificDateString() {
+    return new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+}
+
+// { date, models: { [model]: { used, blockedUntil } } }, reset when the Pacific day changes
+function getGeminiQuota() {
+    const today = getPacificDateString();
+    const quota = readJsonFile(getGeminiQuotaPath(), null);
+    if (!quota || quota.date !== today || !quota.models) {
+        return { date: today, models: {} };
     }
+    return quota;
+}
 
-    return 'gemini-2.5-flash'; // Default to flash for paid API users
+function updateGeminiModelQuota(model, update) {
+    const quota = getGeminiQuota();
+    quota.models[model] = update({ used: 0, ...quota.models[model] });
+    writeJsonFile(getGeminiQuotaPath(), quota);
+}
+
+function recordGeminiModelSuccess(model) {
+    updateGeminiModelQuota(model, entry => ({ ...entry, used: entry.used + 1 }));
+}
+
+function markModelUnavailable(model, retryAfterMs) {
+    updateGeminiModelQuota(model, entry => ({ ...entry, blockedUntil: Date.now() + retryAfterMs }));
+}
+
+function isLiteModel(model) {
+    return model.includes('flash-lite');
+}
+
+function getModelRemaining(entry, now) {
+    if (entry?.blockedUntil > now) return 0;
+    return Math.max(0, GEMINI_FREE_DAILY_REQUESTS - (entry?.used || 0));
+}
+
+function getAvailableModel() {
+    return getModelFallbackChain()[0];
+}
+
+// Models to try in order: ones with quota left first, then unblocked ones (paid keys can exceed 20).
+// If every model is blocked, still try them all rather than failing without a request.
+function getModelFallbackChain() {
+    const now = Date.now();
+    const { models } = getGeminiQuota();
+    // Flash models always think for ~10s before answering; lite models answer in ~3s
+    const ordered = getPreferences().fastAnswers
+        ? [...GEMINI_FALLBACK_MODELS.filter(isLiteModel), ...GEMINI_FALLBACK_MODELS.filter(model => !isLiteModel(model))]
+        : GEMINI_FALLBACK_MODELS;
+    const withQuota = ordered.filter(model => getModelRemaining(models[model], now) > 0);
+    const unblocked = ordered.filter(model => !(models[model]?.blockedUntil > now) && !withQuota.includes(model));
+    const chain = [...withQuota, ...unblocked];
+    return chain.length > 0 ? chain : [...ordered];
+}
+
+// Estimated requests left today across all models (only counts requests made by this app)
+function getGeminiQuotaSummary() {
+    const now = Date.now();
+    const { models } = getGeminiQuota();
+    const remaining = GEMINI_FALLBACK_MODELS.reduce((sum, model) => sum + getModelRemaining(models[model], now), 0);
+    return { remaining, total: GEMINI_FALLBACK_MODELS.length * GEMINI_FREE_DAILY_REQUESTS, nextModel: getAvailableModel() };
 }
 
 function getModelForToday() {
@@ -529,6 +598,10 @@ module.exports = {
     getTodayLimits,
     incrementLimitCount,
     getAvailableModel,
+    getModelFallbackChain,
+    markModelUnavailable,
+    recordGeminiModelSuccess,
+    getGeminiQuotaSummary,
     incrementCharUsage,
     getModelForToday,
 

@@ -3,7 +3,7 @@ const { BrowserWindow, ipcMain } = require('electron');
 const { spawn } = require('child_process');
 const { saveDebugAudio } = require('../audioUtils');
 const { getSystemPrompt } = require('./prompts');
-const { getAvailableModel, incrementLimitCount, getApiKey, getGroqApiKey, incrementCharUsage, getConfig } = require('../storage');
+const { getModelFallbackChain, markModelUnavailable, recordGeminiModelSuccess, getGeminiQuotaSummary, getApiKey, getGroqApiKey, incrementCharUsage, getConfig } = require('../storage');
 const { connectCloud, sendCloudAudio, sendCloudText, sendCloudImage, closeCloud, isCloudActive, setOnTurnComplete } = require('./cloud');
 const { startTransportLog, logTransportEvent, closeTransportLog } = require('./transportLogger');
 
@@ -19,6 +19,9 @@ let currentProviderMode = 'byok';
 
 // Groq conversation history for context
 let groqConversationHistory = [];
+let geminiTextHistory = [];
+let geminiTextOnly = false;
+let lastWorkingGeminiModel = null;
 
 // Conversation tracking variables
 let currentSessionId = null;
@@ -993,39 +996,134 @@ async function sendAudioToGemini(base64Data, geminiSessionRef) {
     }
 }
 
-async function sendImageToGeminiHttp(base64Data, prompt) {
-    // Get available model based on rate limits
-    const model = getAvailableModel();
+function isModelUnavailableError(error) {
+    const status = error?.status ?? error?.code;
+    if ([429, 503, 404].includes(status)) return true;
+    return /\b(503|429|404)\b|UNAVAILABLE|overloaded|RESOURCE_EXHAUSTED|NOT_FOUND/i.test(error?.message || '');
+}
 
+// How long to skip a model after an error, so exhausted models don't waste a request every time
+function getModelSkipMs(error) {
+    const message = error?.message || '';
+    const status = error?.status ?? error?.code;
+
+    if (status === 404 || /\b404\b|NOT_FOUND|no longer available/i.test(message)) {
+        return 24 * 60 * 60 * 1000;
+    }
+
+    if (status === 429 || /\b429\b|RESOURCE_EXHAUSTED/i.test(message)) {
+        // e.g. "Please retry in 4h11m2.8s"
+        const retry = message.match(/retry in (?:(\d+)h)?(?:(\d+)m(?!s))?(?:([\d.]+)s)?/i);
+        if (retry && (retry[1] || retry[2] || retry[3])) {
+            const seconds = Number(retry[1] || 0) * 3600 + Number(retry[2] || 0) * 60 + Number(retry[3] || 0);
+            return Math.ceil(seconds * 1000);
+        }
+        return 60 * 1000;
+    }
+
+    return 0;
+}
+
+async function sendImageToGeminiHttp(base64Data, prompt) {
+    const contents = [
+        {
+            inlineData: {
+                mimeType: 'image/jpeg',
+                data: base64Data,
+            },
+        },
+        { text: prompt },
+    ];
+
+    const result = await streamGeminiHttp(contents, null, 'image');
+    if (result.success) {
+        // Save screen analysis to history
+        saveScreenAnalysis(prompt, result.text, result.model);
+    }
+    return result;
+}
+
+// Text questions when audio is off: plain HTTP request instead of the Live session
+async function sendTextToGeminiHttp(text) {
+    geminiTextHistory.push({ role: 'user', parts: [{ text }] });
+    if (geminiTextHistory.length > 20) {
+        geminiTextHistory = geminiTextHistory.slice(-20);
+    }
+
+    const result = await streamGeminiHttp(geminiTextHistory, currentSystemPrompt, 'text');
+    if (result.success && result.text) {
+        geminiTextHistory.push({ role: 'model', parts: [{ text: result.text }] });
+        saveConversationTurn(text, result.text);
+    } else {
+        // Drop the unanswered question so history keeps alternating user/model turns
+        geminiTextHistory.pop();
+    }
+    return result;
+}
+
+async function initializeGeminiTextSession(customPrompt = '', profile = 'interview') {
+    const enabledTools = await getEnabledTools();
+    const googleSearchEnabled = enabledTools.some(tool => tool.googleSearch);
+    currentSystemPrompt = getSystemPrompt(profile, customPrompt, googleSearchEnabled);
+    geminiTextHistory = [];
+    initializeNewSession(profile, customPrompt);
+    console.log('Gemini text-only session ready (audio off, no Live connection)');
+}
+
+async function streamGeminiHttp(contents, systemInstruction, kind) {
     const apiKey = getApiKey();
     if (!apiKey) {
         return { success: false, error: 'No API key configured' };
     }
 
+    // Models with quota left first, then fallbacks for overloaded (503) or exhausted (429) models
+    const models = getModelFallbackChain();
+    let lastError = null;
+
+    for (const model of models) {
+        const result = await streamGeminiModel(apiKey, model, contents, systemInstruction, kind);
+        if (result.success || !result.retryable) {
+            sendGeminiQuotaToRenderer(result.success ? model : null);
+            return result;
+        }
+        lastError = result.error;
+        console.warn(`${model} unavailable (${result.error}), trying next model...`);
+    }
+
+    sendGeminiQuotaToRenderer(null);
+    return { success: false, error: lastError || 'All Gemini models are unavailable' };
+}
+
+// Live bar shows the model that answered last (or the one that will be tried next) and requests left today
+function sendGeminiQuotaToRenderer(workingModel) {
+    if (workingModel) {
+        lastWorkingGeminiModel = workingModel;
+    }
+    const summary = getGeminiQuotaSummary();
+    sendToRenderer('gemini-quota', {
+        model: lastWorkingGeminiModel || summary.nextModel,
+        remaining: summary.remaining,
+        total: summary.total,
+    });
+}
+
+async function streamGeminiModel(apiKey, model, contents, systemInstruction, kind) {
+    let fullText = '';
+
     try {
         const ai = new GoogleGenAI({ apiKey: apiKey });
 
-        const contents = [
-            {
-                inlineData: {
-                    mimeType: 'image/jpeg',
-                    data: base64Data,
-                },
-            },
-            { text: prompt },
-        ];
-
-        console.log(`Sending image to ${model} (streaming)...`);
+        console.log(`Sending ${kind} to ${model} (streaming)...`);
         const response = await ai.models.generateContentStream({
             model: model,
             contents: contents,
+            ...(systemInstruction ? { config: { systemInstruction } } : {}),
         });
 
-        // Increment count after successful call
-        incrementLimitCount(model);
+        // Count the request once the model accepted it
+        recordGeminiModelSuccess(model);
 
         // Stream the response
-        let fullText = '';
         let isFirst = true;
         for await (const chunk of response) {
             const chunkText = chunk.text;
@@ -1037,15 +1135,23 @@ async function sendImageToGeminiHttp(base64Data, prompt) {
             }
         }
 
-        console.log(`Image response completed from ${model}`);
-
-        // Save screen analysis to history
-        saveScreenAnalysis(prompt, fullText, model);
-
+        console.log(`${kind} response completed from ${model}`);
         return { success: true, text: fullText, model: model };
     } catch (error) {
-        console.error('Error sending image to Gemini HTTP:', error);
-        return { success: false, error: error.message };
+        // The SDK sometimes fails to parse the final stream chunk after the answer already arrived
+        if (fullText && /Incomplete JSON segment/i.test(error?.message || '')) {
+            console.warn(`${kind} stream from ${model} ended with a broken final chunk, keeping the answer`);
+            return { success: true, text: fullText, model: model };
+        }
+
+        console.error(`Error sending ${kind} to Gemini HTTP (${model}):`, error);
+        const skipMs = getModelSkipMs(error);
+        if (skipMs > 0) {
+            markModelUnavailable(model, skipMs);
+        }
+        // Only switch models if nothing was shown yet, otherwise the partial answer would be replaced
+        const retryable = !fullText && (isModelUnavailableError(error) || /Incomplete JSON segment/i.test(error?.message || ''));
+        return { success: false, error: error.message, retryable };
     }
 }
 
@@ -1072,8 +1178,14 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         }
     });
 
-    ipcMain.handle('initialize-gemini', async (event, apiKey, customPrompt, profile = 'interview', language = 'en-US') => {
+    ipcMain.handle('initialize-gemini', async (event, apiKey, customPrompt, profile = 'interview', language = 'en-US', liveAudio = true) => {
         currentProviderMode = 'byok';
+        geminiTextOnly = liveAudio === false;
+        sendGeminiQuotaToRenderer(null);
+        if (geminiTextOnly) {
+            await initializeGeminiTextSession(customPrompt, profile);
+            return true;
+        }
         const session = await initializeGeminiSession(apiKey, customPrompt, profile, language);
         if (session) {
             geminiSessionRef.current = session;
@@ -1229,6 +1341,10 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
                 console.error('Error sending local text:', error);
                 return { success: false, error: error.message };
             }
+        }
+
+        if (geminiTextOnly) {
+            return await sendTextToGeminiHttp(text.trim());
         }
 
         if (!geminiSessionRef.current) return { success: false, error: 'No active Gemini session' };
