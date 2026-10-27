@@ -1,6 +1,17 @@
 import { html, css, LitElement } from '../../assets/lit-core-2.7.4.min.js';
 import { unifiedPageStyles } from './sharedPageStyles.js';
 
+// Keep in sync with GEMINI_FALLBACK_MODELS in src/storage.js
+const GEMINI_MODEL_OPTIONS = [
+    { value: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash (default, ~13s, accurate)' },
+    { value: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash (~13s)' },
+    { value: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash (~13s)' },
+    { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash Preview (~13s)' },
+    { value: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash (~13s, often overloaded)' },
+    { value: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash Lite (fast, ~3s)' },
+    { value: 'gemini-3.1-flash-lite', label: 'Gemini 3.1 Flash Lite (fast, ~3s)' },
+];
+
 export class CustomizeView extends LitElement {
     static styles = [
         unifiedPageStyles,
@@ -182,7 +193,7 @@ export class CustomizeView extends LitElement {
         layoutMode: { type: String },
         keybinds: { type: Object },
         googleSearchEnabled: { type: Boolean },
-        fastAnswers: { type: Boolean },
+        geminiModel: { type: String },
         backgroundTransparency: { type: Number },
         fontSize: { type: Number },
         theme: { type: String },
@@ -215,7 +226,7 @@ export class CustomizeView extends LitElement {
         this.backgroundTransparency = 0.8;
         this.fontSize = 20;
         this.audioMode = 'speaker_only';
-        this.fastAnswers = false;
+        this.geminiModel = 'gemini-3.5-flash';
         this.customPrompt = '';
         this.theme = 'dark';
         this._loadFromStorage();
@@ -232,7 +243,7 @@ export class CustomizeView extends LitElement {
             this.backgroundTransparency = prefs.backgroundTransparency ?? 0.8;
             this.fontSize = prefs.fontSize ?? 20;
             this.audioMode = prefs.audioMode ?? 'speaker_only';
-            this.fastAnswers = prefs.fastAnswers ?? false;
+            this.geminiModel = prefs.geminiModel ?? 'gemini-3.5-flash';
             this.customPrompt = prefs.customPrompt ?? '';
             this.theme = prefs.theme ?? 'dark';
             if (keybinds) {
@@ -371,9 +382,9 @@ export class CustomizeView extends LitElement {
         this.requestUpdate();
     }
 
-    async handleFastAnswersChange(e) {
-        this.fastAnswers = e.target.checked;
-        await cheatingDaddy.storage.updatePreference('fastAnswers', this.fastAnswers);
+    async handleGeminiModelSelect(e) {
+        this.geminiModel = e.target.value;
+        await cheatingDaddy.storage.updatePreference('geminiModel', this.geminiModel);
     }
 
     async handleGoogleSearchChange(e) {
@@ -494,7 +505,7 @@ export class CustomizeView extends LitElement {
                 selectedScreenshotInterval: '5',
                 selectedImageQuality: 'medium',
                 audioMode: 'speaker_only',
-                fastAnswers: false,
+                geminiModel: 'gemini-3.5-flash',
                 fontSize: 20,
                 backgroundTransparency: 0.8,
                 googleSearchEnabled: false,
@@ -517,7 +528,7 @@ export class CustomizeView extends LitElement {
             this.selectedLanguage = defaults.selectedLanguage;
             this.selectedImageQuality = defaults.selectedImageQuality;
             this.audioMode = defaults.audioMode;
-            this.fastAnswers = defaults.fastAnswers;
+            this.geminiModel = defaults.geminiModel;
             this.fontSize = defaults.fontSize;
             this.backgroundTransparency = defaults.backgroundTransparency;
             this.googleSearchEnabled = defaults.googleSearchEnabled;
@@ -602,10 +613,13 @@ export class CustomizeView extends LitElement {
                             <option value="low">Low Quality</option>
                         </select>
                     </div>
-                    <label class="toggle-row">
-                        <input class="toggle-input" type="checkbox" .checked=${this.fastAnswers} @change=${this.handleFastAnswersChange} />
-                        <span class="toggle-label">Fast answers (lite models, ~3s instead of ~13s, less accurate on hard tasks)</span>
-                    </label>
+                    <div class="form-group">
+                        <label class="form-label">Gemini Model (screenshots and text)</label>
+                        <select class="control" @change=${this.handleGeminiModelSelect}>
+                            ${GEMINI_MODEL_OPTIONS.map(option => html`<option value=${option.value} ?selected=${option.value === this.geminiModel}>${option.label}</option>`)}
+                        </select>
+                        <div class="form-help">If the chosen model is overloaded or out of quota, the next one is used automatically.</div>
+                    </div>
                 </div>
             </section>
         `;

@@ -32,7 +32,7 @@ const DEFAULT_PREFERENCES = {
     fontSize: 'medium',
     backgroundTransparency: 0.8,
     googleSearchEnabled: false,
-    fastAnswers: false,
+    geminiModel: 'gemini-3.5-flash',
     localLlmModel: 'unsloth/Qwen3.5-4B-GGUF:Q4_K_M',
     whisperModel: 'tiny.en',
 };
@@ -359,10 +359,11 @@ function incrementCharUsage(provider, model, charCount) {
 
 // Free tier gives 20 requests/day per model, so each model in this list adds its own quota.
 // gemini-2.5-* is gone for new users (404) and gemini-3.8-flash is often overloaded (503).
+const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash';
 const GEMINI_FALLBACK_MODELS = [
-    'gemini-3.7-flash',
-    'gemini-3.5-flash',
+    DEFAULT_GEMINI_MODEL,
     'gemini-3.6-flash',
+    'gemini-3.7-flash',
     'gemini-3-flash-preview',
     'gemini-3.8-flash',
     'gemini-3.5-flash-lite',
@@ -403,6 +404,22 @@ function markModelUnavailable(model, retryAfterMs) {
     updateGeminiModelQuota(model, entry => ({ ...entry, blockedUntil: Date.now() + retryAfterMs }));
 }
 
+// Model chosen in settings goes first. Lite models answer in ~3s, flash models think ~10s first,
+// so the rest of the chain keeps the same kind (lite or flash) as the chosen model before the other kind.
+function getOrderedGeminiModels() {
+    const prefs = getPreferences();
+    // Older configs stored a "fast answers" toggle instead of a model
+    const preferred = GEMINI_FALLBACK_MODELS.includes(prefs.geminiModel)
+        ? prefs.geminiModel
+        : prefs.fastAnswers
+          ? 'gemini-3.5-flash-lite'
+          : DEFAULT_GEMINI_MODEL;
+    const rest = GEMINI_FALLBACK_MODELS.filter(model => model !== preferred);
+    const sameKind = rest.filter(model => isLiteModel(model) === isLiteModel(preferred));
+    const otherKind = rest.filter(model => isLiteModel(model) !== isLiteModel(preferred));
+    return [preferred, ...sameKind, ...otherKind];
+}
+
 function isLiteModel(model) {
     return model.includes('flash-lite');
 }
@@ -421,10 +438,7 @@ function getAvailableModel() {
 function getModelFallbackChain() {
     const now = Date.now();
     const { models } = getGeminiQuota();
-    // Flash models always think for ~10s before answering; lite models answer in ~3s
-    const ordered = getPreferences().fastAnswers
-        ? [...GEMINI_FALLBACK_MODELS.filter(isLiteModel), ...GEMINI_FALLBACK_MODELS.filter(model => !isLiteModel(model))]
-        : GEMINI_FALLBACK_MODELS;
+    const ordered = getOrderedGeminiModels();
     const withQuota = ordered.filter(model => getModelRemaining(models[model], now) > 0);
     const unblocked = ordered.filter(model => !(models[model]?.blockedUntil > now) && !withQuota.includes(model));
     const chain = [...withQuota, ...unblocked];
@@ -599,6 +613,7 @@ module.exports = {
     incrementLimitCount,
     getAvailableModel,
     getModelFallbackChain,
+    GEMINI_FALLBACK_MODELS,
     markModelUnavailable,
     recordGeminiModelSuccess,
     getGeminiQuotaSummary,
