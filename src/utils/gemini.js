@@ -21,7 +21,6 @@ let currentProviderMode = 'byok';
 let groqConversationHistory = [];
 let geminiTextHistory = [];
 let geminiTextOnly = false;
-let lastWorkingGeminiModel = null;
 
 // Conversation tracking variables
 let currentSessionId = null;
@@ -52,6 +51,12 @@ let messageBuffer = '';
 let groqRequestStartedForTurn = false;
 
 const GROQ_MAX_COMPLETION_TOKENS = 16384;
+// Groq's free tier rejects qwen requests asking for more than 1000 output tokens per minute
+const GROQ_QWEN_MAX_COMPLETION_TOKENS = 900;
+const GROQ_TIMEOUT_MS = 60000;
+// Flash models take 11-14s to start answering, so anything past this is treated as a hang
+const GEMINI_FIRST_TEXT_TIMEOUT_MS = 25000;
+const GEMINI_STALL_TIMEOUT_MS = 15000;
 const GROQ_EMPTY_RESPONSE_MESSAGE =
     'Groq reached the maximum completion-token limit before returning a final answer. Disable thinking in Home → AI responses and try again.';
 
@@ -253,6 +258,10 @@ function stripThinkingTags(text) {
     return text.replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, '').trim();
 }
 
+function getGroqMaxCompletionTokens(model) {
+    return model.includes('qwen3') ? GROQ_QWEN_MAX_COMPLETION_TOKENS : GROQ_MAX_COMPLETION_TOKENS;
+}
+
 function getGroqReasoningOptions(model, disableThinking) {
     if (model.includes('qwen3')) {
         const options = {
@@ -279,16 +288,17 @@ async function sendToGroq(transcription) {
     const groqApiKey = getGroqApiKey();
     if (!groqApiKey) {
         console.log('No Groq API key configured, skipping Groq response');
-        return;
+        return { success: false, error: 'No Groq API key configured' };
     }
 
     if (!transcription || transcription.trim() === '') {
         console.log('Empty transcription, skipping Groq');
-        return;
+        return { success: false, error: 'Empty transcription' };
     }
 
     const config = getConfig();
     const modelToUse = config.groqModel;
+    sendGroqModelToRenderer(modelToUse);
 
     console.log(`Sending to Groq (${modelToUse}):`, transcription.substring(0, 100) + '...');
     logTransportEvent('groq.text.request', {
@@ -308,6 +318,7 @@ async function sendToGroq(transcription) {
     try {
         const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
             method: 'POST',
+            signal: AbortSignal.timeout(GROQ_TIMEOUT_MS),
             headers: {
                 Authorization: `Bearer ${groqApiKey}`,
                 'Content-Type': 'application/json',
@@ -317,7 +328,7 @@ async function sendToGroq(transcription) {
                 messages: [{ role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' }, ...groqConversationHistory],
                 stream: true,
                 temperature: 0.7,
-                max_completion_tokens: GROQ_MAX_COMPLETION_TOKENS,
+                max_completion_tokens: getGroqMaxCompletionTokens(modelToUse),
                 ...getGroqReasoningOptions(modelToUse, config.disableGroqThinking),
             }),
         });
@@ -330,7 +341,7 @@ async function sendToGroq(transcription) {
                 body: errorText,
             });
             sendToRenderer('update-status', `Groq error: ${response.status}`);
-            return;
+            return { success: false, error: `Groq error: ${response.status}` };
         }
 
         logTransportEvent('groq.text.http_response', {
@@ -405,7 +416,7 @@ async function sendToGroq(transcription) {
             });
             sendToRenderer('new-response', GROQ_EMPTY_RESPONSE_MESSAGE);
             sendToRenderer('update-status', 'Groq reached the completion-token limit');
-            return;
+            return { success: false, error: GROQ_EMPTY_RESPONSE_MESSAGE };
         }
 
         logTransportEvent('groq.text.completed', {
@@ -413,7 +424,10 @@ async function sendToGroq(transcription) {
             response: cleanedResponse,
         });
         console.log(`Groq response completed (${modelToUse})`);
-        sendToRenderer('update-status', 'Listening...');
+        if (!geminiTextOnly) {
+            sendToRenderer('update-status', 'Listening...');
+        }
+        return { success: true, text: cleanedResponse, model: modelToUse };
     } catch (error) {
         console.error('Error calling Groq API:', error);
         logTransportEvent('groq.text.error', {
@@ -421,6 +435,7 @@ async function sendToGroq(transcription) {
             stack: error.stack,
         });
         sendToRenderer('update-status', 'Groq error: ' + error.message);
+        return { success: false, error: error.message };
     }
 }
 
@@ -428,6 +443,7 @@ async function sendImageToGroq(base64Data, prompt) {
     const groqApiKey = getGroqApiKey();
     const config = getConfig();
     const model = config.groqImageModel;
+    sendGroqModelToRenderer(model);
 
     logTransportEvent('groq.image.request', {
         model,
@@ -438,6 +454,7 @@ async function sendImageToGroq(base64Data, prompt) {
     try {
         const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
             method: 'POST',
+            signal: AbortSignal.timeout(GROQ_TIMEOUT_MS),
             headers: {
                 Authorization: `Bearer ${groqApiKey}`,
                 'Content-Type': 'application/json',
@@ -461,7 +478,7 @@ async function sendImageToGroq(base64Data, prompt) {
                 ],
                 stream: true,
                 temperature: 0.7,
-                max_completion_tokens: GROQ_MAX_COMPLETION_TOKENS,
+                max_completion_tokens: getGroqMaxCompletionTokens(model),
                 ...getGroqReasoningOptions(model, config.disableGroqThinking),
             }),
         });
@@ -532,12 +549,19 @@ async function sendImageToGroq(base64Data, prompt) {
             return { success: false, error: GROQ_EMPTY_RESPONSE_MESSAGE };
         }
 
-        saveScreenAnalysis(prompt, cleanedResponse, model);
+        // The output cap can end an answer mid-sentence, so say so instead of stopping silently
+        let finalResponse = cleanedResponse;
+        if (finishReason === 'length') {
+            finalResponse += '\n\n[Answer cut off: Groq output limit reached]';
+            sendToRenderer('update-response', finalResponse);
+        }
+
+        saveScreenAnalysis(prompt, finalResponse, model);
         logTransportEvent('groq.image.completed', {
             model,
-            response: cleanedResponse,
+            response: finalResponse,
         });
-        return { success: true, text: cleanedResponse, model };
+        return { success: true, text: finalResponse, model };
     } catch (error) {
         console.error('Error calling Groq image API:', error);
         logTransportEvent('groq.image.error', {
@@ -1036,6 +1060,9 @@ async function sendImageToGeminiHttp(base64Data, prompt) {
     ];
 
     const result = await streamGeminiHttp(contents, null, 'image');
+    if (shouldFallBackToGroq(result)) {
+        return await fallBackToGroq(result, () => sendImageToGroq(base64Data, prompt));
+    }
     if (result.success) {
         // Save screen analysis to history
         saveScreenAnalysis(prompt, result.text, result.model);
@@ -1051,6 +1078,20 @@ async function sendTextToGeminiHttp(text) {
     }
 
     const result = await streamGeminiHttp(geminiTextHistory, currentSystemPrompt, 'text');
+    if (shouldFallBackToGroq(result)) {
+        // Groq keeps its own history, so hand it the conversation so far (sendToGroq adds this question)
+        groqConversationHistory = geminiTextHistory.slice(0, -1).map(turn => ({
+            role: turn.role === 'model' ? 'assistant' : 'user',
+            content: turn.parts[0].text,
+        }));
+        const groqResult = await fallBackToGroq(result, () => sendToGroq(text));
+        if (groqResult.success) {
+            geminiTextHistory.push({ role: 'model', parts: [{ text: groqResult.text }] });
+        } else {
+            geminiTextHistory.pop();
+        }
+        return groqResult;
+    }
     if (result.success && result.text) {
         geminiTextHistory.push({ role: 'model', parts: [{ text: result.text }] });
         saveConversationTurn(text, result.text);
@@ -1070,6 +1111,20 @@ async function initializeGeminiTextSession(customPrompt = '', profile = 'intervi
     console.log('Gemini text-only session ready (audio off, no Live connection)');
 }
 
+// Groq only steps in when Gemini failed before showing any text, so a partial answer is never replaced
+function shouldFallBackToGroq(result) {
+    return !result.success && !result.partial && hasGroqKey();
+}
+
+async function fallBackToGroq(geminiResult, sendRequest) {
+    console.warn(`Gemini failed (${geminiResult.error}), falling back to Groq...`);
+    const result = await sendRequest();
+    if (!result.success) {
+        result.error = `${result.error} | Gemini: ${String(geminiResult.error).slice(0, 200)}`;
+    }
+    return result;
+}
+
 async function streamGeminiHttp(contents, systemInstruction, kind) {
     const apiKey = getApiKey();
     if (!apiKey) {
@@ -1081,51 +1136,76 @@ async function streamGeminiHttp(contents, systemInstruction, kind) {
     let lastError = null;
 
     for (const model of models) {
+        sendActiveModelToRenderer(model);
         const result = await streamGeminiModel(apiKey, model, contents, systemInstruction, kind);
         if (result.success || !result.retryable) {
-            sendGeminiQuotaToRenderer(result.success ? model : null);
+            sendActiveModelToRenderer(result.success ? model : null);
             return result;
         }
         lastError = result.error;
         console.warn(`${model} unavailable (${result.error}), trying next model...`);
+        // A hang already cost the full timeout, so don't wait on every other Gemini model too
+        if (result.timedOut && hasGroqKey()) break;
     }
 
-    sendGeminiQuotaToRenderer(null);
+    sendActiveModelToRenderer();
     return { success: false, error: lastError || 'All Gemini models are unavailable' };
 }
 
-// Live bar shows the model that answered last (or the one that will be tried next) and requests left today
-function sendGeminiQuotaToRenderer(workingModel) {
-    if (workingModel) {
-        lastWorkingGeminiModel = workingModel;
-    }
+// Live bar shows the model handling the current request (updated on every switch) and free requests left today
+function sendActiveModelToRenderer(model = null) {
     const summary = getGeminiQuotaSummary();
     sendToRenderer('gemini-quota', {
-        model: lastWorkingGeminiModel || summary.nextModel,
+        model: model || summary.nextModel,
         remaining: summary.remaining,
         total: summary.total,
     });
 }
 
+function sendGroqModelToRenderer(model) {
+    sendToRenderer('gemini-quota', { model: `Groq: ${model}`, remaining: null, total: null });
+}
+
+class GeminiTimeoutError extends Error {}
+
+function withTimeout(promise, ms) {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new GeminiTimeoutError(`no response for ${Math.round(ms / 1000)}s`)), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 async function streamGeminiModel(apiKey, model, contents, systemInstruction, kind) {
     let fullText = '';
+    const controller = new AbortController();
+    const startedAt = Date.now();
+    // Time left for the first word, or the allowed gap between words once the answer has started
+    const nextWaitMs = () => (fullText ? GEMINI_STALL_TIMEOUT_MS : Math.max(GEMINI_FIRST_TEXT_TIMEOUT_MS - (Date.now() - startedAt), 1));
 
     try {
         const ai = new GoogleGenAI({ apiKey: apiKey });
 
         console.log(`Sending ${kind} to ${model} (streaming)...`);
-        const response = await ai.models.generateContentStream({
-            model: model,
-            contents: contents,
-            ...(systemInstruction ? { config: { systemInstruction } } : {}),
-        });
+        const response = await withTimeout(
+            ai.models.generateContentStream({
+                model: model,
+                contents: contents,
+                config: { ...(systemInstruction ? { systemInstruction } : {}), abortSignal: controller.signal },
+            }),
+            nextWaitMs()
+        );
 
         // Count the request once the model accepted it
         recordGeminiModelSuccess(model);
 
         // Stream the response
+        const chunks = response[Symbol.asyncIterator]();
         let isFirst = true;
-        for await (const chunk of response) {
+        while (true) {
+            const { value: chunk, done } = await withTimeout(chunks.next(), nextWaitMs());
+            if (done) break;
+
             const chunkText = chunk.text;
             if (chunkText) {
                 fullText += chunkText;
@@ -1138,6 +1218,22 @@ async function streamGeminiModel(apiKey, model, contents, systemInstruction, kin
         console.log(`${kind} response completed from ${model}`);
         return { success: true, text: fullText, model: model };
     } catch (error) {
+        if (error instanceof GeminiTimeoutError) {
+            controller.abort();
+            console.warn(`${kind} request to ${model} timed out (${error.message})`);
+            if (fullText) {
+                const cutOffText = `${fullText}\n\n[Answer cut off: ${model} stopped responding]`;
+                sendToRenderer('update-response', cutOffText);
+                return { success: true, text: cutOffText, model: model };
+            }
+            return {
+                success: false,
+                error: `${model} did not respond in ${GEMINI_FIRST_TEXT_TIMEOUT_MS / 1000}s`,
+                retryable: true,
+                timedOut: true,
+            };
+        }
+
         // The SDK sometimes fails to parse the final stream chunk after the answer already arrived
         if (fullText && /Incomplete JSON segment/i.test(error?.message || '')) {
             console.warn(`${kind} stream from ${model} ended with a broken final chunk, keeping the answer`);
@@ -1151,7 +1247,7 @@ async function streamGeminiModel(apiKey, model, contents, systemInstruction, kin
         }
         // Only switch models if nothing was shown yet, otherwise the partial answer would be replaced
         const retryable = !fullText && (isModelUnavailableError(error) || /Incomplete JSON segment/i.test(error?.message || ''));
-        return { success: false, error: error.message, retryable };
+        return { success: false, error: error.message, retryable, partial: Boolean(fullText) };
     }
 }
 
@@ -1181,7 +1277,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
     ipcMain.handle('initialize-gemini', async (event, apiKey, customPrompt, profile = 'interview', language = 'en-US', liveAudio = true) => {
         currentProviderMode = 'byok';
         geminiTextOnly = liveAudio === false;
-        sendGeminiQuotaToRenderer(null);
+        sendActiveModelToRenderer();
         if (geminiTextOnly) {
             await initializeGeminiTextSession(customPrompt, profile);
             return true;
@@ -1309,7 +1405,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
                 return result;
             }
 
-            const result = hasGroqKey() ? await sendImageToGroq(data, prompt) : await sendImageToGeminiHttp(data, prompt);
+            const result = await sendImageToGeminiHttp(data, prompt);
             return result;
         } catch (error) {
             console.error('Error sending image:', error);

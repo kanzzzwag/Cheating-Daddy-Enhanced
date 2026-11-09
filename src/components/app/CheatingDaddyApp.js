@@ -964,8 +964,8 @@ export class CheatingDaddyApp extends LitElement {
                 <div class="live-bar-right">
                     ${this.statusText ? html`<span class="live-bar-text">${this.statusText}</span>` : ''}
                     ${this._geminiQuota
-                        ? html`<span class="live-bar-text" title="Model that answered last · estimated free requests left today (resets at midnight Pacific time)"
-                              >${this._geminiQuota.model} · ${this._geminiQuota.remaining}/${this._geminiQuota.total} left</span
+                        ? html`<span class="live-bar-text" title="Model handling requests now · estimated free Gemini requests left today (resets at midnight Pacific time)"
+                              >${this._geminiQuota.model}${this._geminiQuota.remaining === null ? '' : ` · ${this._geminiQuota.remaining}/${this._geminiQuota.total} left`}</span
                           >`
                         : ''}
                     <span class="live-bar-text">${this.getElapsedTime()}</span>
