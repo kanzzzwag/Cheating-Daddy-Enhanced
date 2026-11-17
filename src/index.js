@@ -2,10 +2,13 @@ if (require('electron-squirrel-startup')) {
     process.exit(0);
 }
 
-const { app, BrowserWindow, shell, ipcMain } = require('electron');
+const fs = require('fs');
+const path = require('path');
+const { app, BrowserWindow, shell, ipcMain, dialog } = require('electron');
 const { createWindow, updateGlobalShortcuts } = require('./utils/window');
 const { setupGeminiIpcHandlers, stopMacOSAudioCapture, sendToRenderer } = require('./utils/gemini');
 const storage = require('./storage');
+const { getExportableSessions, buildHistoryMarkdown, buildHistoryJson, getDefaultExportFileName } = require('./utils/historyExport');
 
 const geminiSessionRef = { current: null };
 let mainWindow = null;
@@ -223,6 +226,43 @@ function setupStorageIpcHandlers() {
             return { success: true };
         } catch (error) {
             console.error('Error deleting session:', error);
+            return { success: false, error: error.message };
+        }
+    });
+
+    // Download one session (sessionId) or all of them (null) as Markdown or JSON, chosen in the save dialog
+    ipcMain.handle('storage:export-history', async (event, sessionId = null) => {
+        try {
+            // Session ids are timestamps used as file names, so only digits are accepted
+            if (sessionId !== null && !/^\d+$/.test(String(sessionId))) {
+                return { success: false, error: 'Invalid session id' };
+            }
+
+            const isSingleSession = sessionId !== null;
+            const sessions = getExportableSessions(
+                isSingleSession ? [storage.getSession(String(sessionId))] : storage.getAllSessions().map(s => storage.getSession(s.sessionId))
+            );
+            if (sessions.length === 0) {
+                return { success: false, error: 'No saved requests to download' };
+            }
+
+            const { canceled, filePath } = await dialog.showSaveDialog(BrowserWindow.fromWebContents(event.sender), {
+                title: 'Download history',
+                defaultPath: path.join(app.getPath('downloads'), getDefaultExportFileName(sessions, isSingleSession)),
+                filters: [
+                    { name: 'Markdown', extensions: ['md'] },
+                    { name: 'JSON', extensions: ['json'] },
+                ],
+            });
+            if (canceled || !filePath) {
+                return { success: false, canceled: true };
+            }
+
+            const content = filePath.toLowerCase().endsWith('.json') ? buildHistoryJson(sessions) : buildHistoryMarkdown(sessions);
+            await fs.promises.writeFile(filePath, content, 'utf8');
+            return { success: true, filePath, count: sessions.length };
+        } catch (error) {
+            console.error('Error exporting history:', error);
             return { success: false, error: error.message };
         }
     });

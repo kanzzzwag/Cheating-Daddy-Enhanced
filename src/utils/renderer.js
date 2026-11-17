@@ -96,6 +96,10 @@ const storage = {
     async deleteAllSessions() {
         return ipcRenderer.invoke('storage:delete-all-sessions');
     },
+    // sessionId = null downloads every session
+    async exportHistory(sessionId = null) {
+        return ipcRenderer.invoke('storage:export-history', sessionId);
+    },
 
     // Clear all
     async clearAll() {

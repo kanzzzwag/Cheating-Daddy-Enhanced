@@ -245,6 +245,49 @@ export class HistoryView extends LitElement {
                 cursor: text;
             }
 
+            .list-toolbar {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: var(--space-sm);
+            }
+
+            .list-toolbar .search-wrap {
+                flex: 1;
+            }
+
+            .download-btn {
+                border: 1px solid var(--border);
+                border-radius: var(--radius-sm);
+                background: transparent;
+                color: var(--text-secondary);
+                padding: 6px 10px;
+                cursor: pointer;
+                font-size: var(--font-size-xs);
+                white-space: nowrap;
+            }
+
+            .download-btn:hover:not(:disabled) {
+                color: var(--text-primary);
+                border-color: var(--text-secondary);
+            }
+
+            .download-btn:disabled {
+                opacity: 0.5;
+                cursor: default;
+            }
+
+            .detail-top .download-btn {
+                margin-left: auto;
+            }
+
+            .export-status {
+                color: var(--text-muted);
+                font-size: var(--font-size-xs);
+                word-break: break-all;
+                user-select: text;
+            }
+
             .empty {
                 color: var(--text-muted);
                 font-size: var(--font-size-sm);
@@ -265,6 +308,8 @@ export class HistoryView extends LitElement {
         loading: { type: Boolean },
         activeTab: { type: String },
         searchQuery: { type: String },
+        exporting: { type: Boolean },
+        exportStatus: { type: String },
     };
 
     constructor() {
@@ -275,7 +320,28 @@ export class HistoryView extends LitElement {
         this.loading = true;
         this.activeTab = 'conversation';
         this.searchQuery = '';
+        this.exporting = false;
+        this.exportStatus = '';
         this.loadSessions();
+    }
+
+    // sessionId = null downloads every session
+    async exportHistory(sessionId = null) {
+        this.exporting = true;
+        this.exportStatus = '';
+        try {
+            const result = await cheatingDaddy.storage.exportHistory(sessionId);
+            if (result.success) {
+                this.exportStatus = `Saved ${result.count} session(s) to ${result.filePath}`;
+            } else if (!result.canceled) {
+                this.exportStatus = `Download failed: ${result.error}`;
+            }
+        } catch (error) {
+            console.error('Error exporting history:', error);
+            this.exportStatus = `Download failed: ${error.message}`;
+        } finally {
+            this.exporting = false;
+        }
     }
 
     async loadSessions() {
@@ -298,6 +364,7 @@ export class HistoryView extends LitElement {
                 this.selectedSession = session;
                 this.selectedSessionId = sessionId;
                 this.activeTab = 'conversation';
+                this.exportStatus = '';
                 this.requestUpdate();
             }
         } catch (error) {
@@ -309,6 +376,7 @@ export class HistoryView extends LitElement {
         this.selectedSession = null;
         this.selectedSessionId = null;
         this.activeTab = 'conversation';
+        this.exportStatus = '';
     }
 
     handleSearchInput(e) {
@@ -434,19 +502,25 @@ export class HistoryView extends LitElement {
         return html`
             <div class="page-title">History</div>
 
-            <div class="search-wrap">
-                <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <circle cx="11" cy="11" r="8"/>
-                    <line x1="21" y1="21" x2="16.65" y2="16.65"/>
-                </svg>
-                <input
-                    class="control"
-                    type="text"
-                    placeholder="Search sessions..."
-                    .value=${this.searchQuery}
-                    @input=${this.handleSearchInput}
-                />
+            <div class="list-toolbar">
+                <div class="search-wrap">
+                    <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="11" cy="11" r="8"/>
+                        <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                    </svg>
+                    <input
+                        class="control"
+                        type="text"
+                        placeholder="Search sessions..."
+                        .value=${this.searchQuery}
+                        @input=${this.handleSearchInput}
+                    />
+                </div>
+                <button class="download-btn" ?disabled=${this.exporting || this.sessions.length === 0} @click=${() => this.exportHistory(null)}>
+                    ${this.exporting ? 'Saving...' : 'Download all'}
+                </button>
             </div>
+            ${this.exportStatus ? html`<div class="export-status">${this.exportStatus}</div>` : ''}
 
             <section class="list-shell">
                 <div class="sessions-list">
@@ -479,7 +553,15 @@ export class HistoryView extends LitElement {
                     </svg>
                 </button>
                 <span class="detail-info">${this._getProfileLabel(this.selectedSession)} · ${this.formatDate(this.selectedSession.createdAt)} · ${this.formatTime(this.selectedSession.createdAt)}</span>
+                <button
+                    class="download-btn"
+                    ?disabled=${this.exporting || (conversationCount === 0 && screenCount === 0)}
+                    @click=${() => this.exportHistory(this.selectedSessionId)}
+                >
+                    ${this.exporting ? 'Saving...' : 'Download'}
+                </button>
             </div>
+            ${this.exportStatus ? html`<div class="export-status">${this.exportStatus}</div>` : ''}
             <div class="tab-row">
                 <button class="tab-btn ${this.activeTab === 'conversation' ? 'active' : ''}" @click=${() => { this.activeTab = 'conversation'; }}>
                     Conversation (${conversationCount})
